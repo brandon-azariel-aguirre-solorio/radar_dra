@@ -1,86 +1,258 @@
-import android.bluetooth.BluetoothAdapter
+package com.example.radar_bt.presentation
+import android.Manifest
+import android.bluetooth.BluetoothManager
+import android.bluetooth.le.BluetoothLeScanner
 import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanResult
+import android.content.Context
+import android.content.pm.PackageManager
+import android.os.Build
+import android.os.Bundle
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.core.*
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.drawText
+import androidx.compose.ui.text.rememberTextMeasurer
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
+import kotlin.math.cos
 import kotlin.math.pow
+import kotlin.math.sin
 
-class RadarManager {
-    private val bluetoothAdapter: BluetoothAdapter? = BluetoothAdapter.getDefaultAdapter()
-    private val bleScanner = bluetoothAdapter?.bluetoothLeScanner
+// Estructura de datos para las esferas detectadas
+data class DispositivoBle(
+    val mac: String,
+    val nombre: String,
+    val tipo: String,
+    val distancia: Double,
+    val angulo: Double
+)
 
-    // Estructura idéntica para los pings del radar
-    data class Dispositivo(
-        val mac: String,
-        val nombre: String,
-        val tipo: String,
-        var rssi: Int,
-        var distancia: Double,
-        val angulo: Double = Math.random() * 2 * Math.PI // Ángulo fijo por dispositivo
-    )
+class MainActivity : ComponentActivity() {
 
-    val listaDispositivos = mutableMapOf<String, Dispositivo>()
+    private var bluetoothLeScanner: BluetoothLeScanner? = null
 
-    fun iniciarEscaneo() {
+    // Estado dinámico en Kotlin para avisarle a la interfaz gráfica cuando cambien los pings
+    private val listaDispositivos = mutableStateMapOf<String, DispositivoBle>()
+
+    // Lanzador automático para pedir los permisos al usuario de forma segura
+    private val pedirPermisosLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { permisos ->
+        val todosConcedidos = permisos.values.all { it }
+        if (todosConcedidos) {
+            iniciarEscaneoBle()
+        }
+    }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+
+        // Inicializar adaptadores nativos del reloj
+        val bluetoothManager = getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
+        bluetoothLeScanner = bluetoothManager.adapter?.bluetoothLeScanner
+
+        setContent {
+            // Dibujar la interfaz en la pantalla redonda
+            PantallaRadarDragon(dispositivos = listaDispositivos.values.toList())
+        }
+
+        verificarYPedirPermisos()
+    }
+
+    private fun verificarYPedirPermisos() {
+        val permisosNecesarios = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            arrayOf(
+                Manifest.permission.BLUETOOTH_SCAN,
+                Manifest.permission.BLUETOOTH_CONNECT,
+                Manifest.permission.ACCESS_FINE_LOCATION
+            )
+        } else {
+            arrayOf(
+                Manifest.permission.ACCESS_FINE_LOCATION,
+                Manifest.permission.ACCESS_COARSE_LOCATION
+            )
+        }
+
+        val faltanPermisos = permisosNecesarios.any {
+            ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
+        }
+
+        if (faltanPermisos) {
+            pedirPermisosLauncher.launch(permisosNecesarios)
+        } else {
+            iniciarEscaneoBle()
+        }
+    }
+
+    private fun iniciarEscaneoBle() {
         val scanCallback = object : ScanCallback() {
             override fun onScanResult(callbackType: Int, result: ScanResult) {
-                val device = result.device
+                val mac = result.device.address
                 val rssi = result.rssi
-                val mac = device.address
-                
-                // 1. Calcular distancia usando la misma fórmula matemática
+
+                // --- MATEMÁTICAS RADAR DRAGÓN (Escala 3 metros) ---
                 val medidoRssi = -60
                 val factorN = 2.6
-                val distancia = 10.0.pow((medidoRssi - rssi) / (10.0 * factorN))
+                val distanciaNueva = 10.0.pow((medidoRssi - rssi) / (10.0 * factorN))
 
-                // Solo nos interesan dispositivos dentro del rango de 3 metros
-                if (distancia <= 3.0) {
+                if (distanciaNueva <= 3.0) {
                     val nombre = result.scanRecord?.deviceName ?: "Oculto"
-                    
-                    // 2. Extraer el Tipo de dispositivo analizando el Payload binario (Appearance)
-                    val tipo = descubrirTipo(result)
+                    val tipo = descubrirTipoDispositivo(result)
 
-                    // 3. Memoria y Filtro de estabilidad (Evitar saltos si el cambio es menor a 15cm)
                     val dispositivoExistente = listaDispositivos[mac]
-                    if (dispositivoExistente == null || Math.abs(dispositivoExistente.distancia - distancia) > 0.15) {
-                        val nuevoDispositivo = Dispositivo(
+
+                    // FILTRO DE ESTABILIDAD: Si cambia menos de 15cm, dejamos el punto congelado
+                    if (dispositivoExistente == null || Math.abs(dispositivoExistente.distancia - distanciaNueva) > 0.15) {
+
+                        // Si es nuevo asignamos un ángulo al azar, si ya existía mantenemos su ángulo fijo
+                        val anguloFijo = dispositivoExistente?.angulo ?: (Math.random() * 2 * Math.PI)
+
+                        listaDispositivos[mac] = DispositivoBle(
                             mac = mac,
                             nombre = nombre,
                             tipo = tipo,
-                            rssi = rssi,
-                            distancia = distancia,
-                            angulo = dispositivoExistente?.angulo ?: (Math.random() * 2 * Math.PI)
+                            distancia = distanciaNueva,
+                            angulo = anguloFijo
                         )
-                        listaDispositivos[mac] = nuevoDispositivo
-                        
-                        // Aquí disparas la actualización de tu interfaz gráfica del reloj
                     }
                 }
             }
         }
-        bleScanner?.startScan(scanCallback)
+
+        // Verifica si tiene permisos antes de arrancar la antena (evita crashes)
+        try {
+            bluetoothLeScanner?.startScan(scanCallback)
+        } catch (e: SecurityException) {
+            e.printStackTrace()
+        }
     }
+    private fun descubrirTipoDispositivo(result: ScanResult): String {
+        val name = result.scanRecord?.deviceName?.lowercase() ?: ""
 
-    // Analiza los bytes puros comerciales de Bluetooth (idéntico a la función C++ del ESP32)
-    private fun descubrirTipo(result: ScanResult): String {
-        val scanRecord = result.scanRecord
-        val name = scanRecord?.deviceName?.lowercase() ?: ""
-
-        // Intentar leer por Appearance Data en las propiedades BLE estándar
-        // En Android, muchas veces el sistema ya procesa parte del payload en device.bluetoothClass
-        val deviceClass = result.device.bluetoothClass?.majorDeviceClass
-        when (deviceClass) {
-            android.bluetooth.BluetoothClass.Device.Major.PHONE -> return "📱 Celular"
-            android.bluetooth.BluetoothClass.Device.Major.COMPUTER -> return "💻 Computadora"
-            android.bluetooth.BluetoothClass.Device.Major.AUDIO_VIDEO -> return "🎧 Audio"
-            android.bluetooth.BluetoothClass.Device.Major.WEARABLE -> return "⌚ Wearable"
+        // Envolvemos la lectura de la clase del dispositivo en un try-catch de seguridad
+        val deviceClass = try {
+            result.device.bluetoothClass?.majorDeviceClass
+        } catch (e: SecurityException) {
+            null // Si no hay permiso, devolvemos nulo de forma segura para que use el filtro de nombres
         }
 
-        // Filtro por palabras clave en el nombre si el chip oculta su clase
+        when (deviceClass) {
+            android.bluetooth.BluetoothClass.Device.Major.PHONE -> return "📱"
+            android.bluetooth.BluetoothClass.Device.Major.COMPUTER -> return "💻"
+            android.bluetooth.BluetoothClass.Device.Major.AUDIO_VIDEO -> return "🎧"
+        }
+
         return when {
-            name.contains("audio") || name.contains("airpods") || name.contains("jbl") || name.contains("earbud") -> "🎧 Audio"
-            name.contains("laptop") || name.contains("pc") || name.contains("lenovo") || name.contains("hp") -> "💻 Computadora"
-            name.contains("phone") || name.contains("iphone") || name.contains("galaxy") -> "📱 Celular"
-            name.contains("watch") || name.contains("band") -> "⌚ Wearable"
-            else -> "📡 Desconocido"
+            name.contains("audio") || name.contains("airpods") || name.contains("buds") || name.contains("jbl") -> "🎧"
+            name.contains("pc") || name.contains("laptop") || name.contains("lenovo") || name.contains("hp") -> "💻"
+            name.contains("phone") || name.contains("iphone") || name.contains("galaxy") -> "📱"
+            name.contains("watch") || name.contains("band") -> "⌚"
+            else -> "📡"
+        }
+    }
+}
+
+// --- LOGICA DE DISEÑO GRÁFICO (JETPACK COMPOSE) ---
+@Composable
+fun PantallaRadarDragon(dispositivos: List<DispositivoBle>) {
+    // Animación infinita para la línea verde del radar (gira 360 grados cada 2.5s)
+    val infiniteTransition = rememberInfiniteTransition(label = "radar")
+    val anguloLinea by infiniteTransition.animateFloat(
+        initialValue = 0f,
+        targetValue = 360f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(2500, easing = LinearEasing),
+            repeatMode = RepeatMode.Restart
+        ),
+        label = "giro"
+    )
+
+    val textMeasurer = rememberTextMeasurer()
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color(0xFF1A1A1A)),
+        contentAlignment = Alignment.Center
+    ) {
+        // Lienzo para dibujar de forma nativa con el procesador gráfico del reloj
+        Canvas(
+            modifier = Modifier
+                .size(180.dp) // Tamaño ideal para smartwatches circulares
+                .clip(CircleShape)
+                .background(Color(0xFF009432))
+        ) {
+            val centroX = size.width / 2
+            val centroY = size.height / 2
+            val radioMaximo = size.width / 2
+
+            // 1. Dibujar la cuadrícula del radar (Líneas divisorias)
+            drawCircle(color = Color(0x33000000), radius = radioMaximo * 0.66f, style = Stroke(width = 1f))
+            drawCircle(color = Color(0x33000000), radius = radioMaximo * 0.33f, style = Stroke(width = 1f))
+            drawLine(color = Color(0x33000000), start = Offset(0f, centroY), end = Offset(size.width, centroY))
+            drawLine(color = Color(0x33000000), start = Offset(centroX, 0f), end = Offset(centroX, size.height))
+
+            // 2. Dibujar la línea de escaneo verde giratoria
+            val radianesLinea = Math.toRadians(anguloLinea.toDouble())
+            val destinoX = centroX + radioMaximo * cos(radianesLinea).toFloat()
+            val destinoY = centroY + radioMaximo * sin(radianesLinea).toFloat()
+            drawLine(
+                color = Color(0xFF00FF00),
+                start = Offset(centroX, centroY),
+                end = Offset(destinoX, destinoY),
+                strokeWidth = 3f
+            )
+
+            // 3. Dibujar los dispositivos (Esferas) activos en rango
+            dispositivos.forEach { dispositivo ->
+                // Mapeo matemático: Proporción física según la distancia (Límite 3 metros)
+                val r = (dispositivo.distancia / 3.0) * radioMaximo
+                val x = centroX + r * cos(dispositivo.angulo)
+                val y = centroY + r * sin(dispositivo.angulo)
+
+                // Si está a menos de 30 cm se dibuja en Rojo parpadeante, de lo contrario Amarillo
+                val esCerca = dispositivo.distancia <= 0.30
+                val colorEsfera = if (esCerca) Color.Red else Color(0xFFFFEB3B)
+
+                // Graficar el punto de la esfera
+                drawCircle(
+                    color = colorEsfera,
+                    radius = 7f,
+                    center = Offset(x.toFloat(), y.toFloat())
+                )
+
+                // Renderizar la etiqueta de texto (Emoji + Distancia) al lado de la esfera
+                val textoEtiqueta = if (esCerca) {
+                    "${dispositivo.tipo} ${Math.round(dispositivo.distancia * 100)} cm"
+                } else {
+                    "${dispositivo.tipo} ${String.format("%.2fm", dispositivo.distancia)}"
+                }
+
+                drawText(
+                    textMeasurer = textMeasurer,
+                    text = textoEtiqueta,
+                    style = TextStyle(color = Color.White, fontSize = 9.sp),
+                    topLeft = Offset(x.toFloat() + 10f, y.toFloat() - 15f)
+                )
+            }
+
+            // 4. Nodo central fijo (La flecha roja de tu propia ubicación)
+            drawCircle(color = Color.Red, radius = 5f, center = Offset(centroX, centroY))
         }
     }
 }
